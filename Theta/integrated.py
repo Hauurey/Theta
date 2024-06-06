@@ -4,12 +4,14 @@ import queue
 import cv2
 import numpy as np
 from datetime import datetime, timedelta
-from flask import Flask, render_template, Response, request, redirect, url_for, session, flash, jsonify
+from flask import Flask, render_template, Response, request, redirect, url_for, session, flash, jsonify, send_from_directory
 from email.message import EmailMessage
 from PIL import Image
 import smtplib
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, emit
 import sys
+
+CREDENTIALS_FILE = 'credentials.txt'
 
 app = Flask(__name__)
 socketio = SocketIO(app)
@@ -17,7 +19,6 @@ app.secret_key = 'your_secret_key'  # Set your secret key for session management
 
 # Email configuration
 Sender_Email = "202110035@fit.edu.ph"
-Reciever_Email = "anonuevo.harry.s@gmail.com"
 Password = "vdca prti xerc wsba"  # Use app-specific password if using Gmail
 
 image_queue = queue.Queue()
@@ -37,12 +38,12 @@ def restart_flask_app():
     os.execl(python, python, *sys.argv)
 
 def get_log_file_path():
-    current_date = datetime.now().strftime('%m-%d-%Y')
+    current_date = datetime.now().strftime('%B %d, %Y')  
     return os.path.join(log_dir, f'{current_date}.txt')
 
 def log_message(message):
     global log_file, log_file_path
-    current_date = datetime.now().strftime('%m-%d-%Y')
+    current_date = datetime.now().strftime('%B %d, %Y') 
     new_log_file_path = get_log_file_path()
     if new_log_file_path != log_file_path:
         if log_file:
@@ -55,24 +56,44 @@ def log_message(message):
     log_file.flush()
     socketio.emit('log_update', log_entry)
 
+def get_receiver_email():
+    if os.path.exists(CREDENTIALS_FILE):
+        with open(CREDENTIALS_FILE, 'r') as file:
+            line = file.readline().strip()
+            email, _ = line.split(',')
+            return email
+    return None
+
 def send_email_with_image(image_path):
-    newMessage = EmailMessage()
-    newMessage['Subject'] = "Unknown Faces Image"
-    newMessage['From'] = Sender_Email
-    newMessage['To'] = Reciever_Email
-    newMessage.set_content('Let me know what you think. Image attached!')
+    def email_thread():
+        receiver_email = get_receiver_email()
+        if receiver_email is None:
+            log_message("Receiver email not found in credentials file.")
+            return
 
-    with open(image_path, 'rb') as f:
-        image_data = f.read()
-        image = Image.open(f)
-        image_type = image.format.lower()
-        image_name = os.path.basename(image_path)
+        newMessage = EmailMessage()
+        newMessage['Subject'] = "Theta Security System Captured Image"
+        newMessage['From'] = Sender_Email
+        newMessage['To'] = receiver_email
+        newMessage.set_content('Let me know what you think. Image attached!')
 
-    newMessage.add_attachment(image_data, maintype='image', subtype=image_type, filename=image_name)
+        with open(image_path, 'rb') as f:
+            image_data = f.read()
+            image = Image.open(f)
+            image_type = image.format.lower()
+            image_name = os.path.basename(image_path)
 
-    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-        smtp.login(Sender_Email, Password)
-        smtp.send_message(newMessage)
+        newMessage.add_attachment(image_data, maintype='image', subtype=image_type, filename=image_name)
+
+        try:
+            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+                smtp.login(Sender_Email, Password)
+                smtp.send_message(newMessage)
+        except Exception as e:
+            log_message(f"Failed to send email: {e}")
+
+    email_thread = threading.Thread(target=email_thread)
+    email_thread.start()
 
 def handle_image_tasks():
     image_counter = 0  # Initialize the image counter
@@ -102,9 +123,25 @@ unknown_faces_dir = 'unknown_faces'
 if not os.path.exists(unknown_faces_dir):
     os.makedirs(unknown_faces_dir)
 
+motion_detected_dir = 'motion_detected_images'
+if not os.path.exists(motion_detected_dir):
+    os.makedirs(motion_detected_dir)
+
 data_dir = 'data'
 if not os.path.exists(data_dir):
     os.makedirs(data_dir)
+
+# Define relative paths
+data_dir = 'data'
+unknown_faces_dir = 'unknown_faces'
+motion_detected_dir = 'motion_detected_images'
+datasets_dir = os.path.join('datasets')
+logs_dir = 'logs'
+
+# Ensure directories exist
+for directory in [data_dir, unknown_faces_dir, motion_detected_dir, datasets_dir, logs_dir]:
+    if not os.path.exists(directory):
+        os.makedirs(directory)
 
 id_name_dict = {}
 id_name_file_path = os.path.join(data_dir, "id_name.txt")
@@ -121,7 +158,7 @@ backSub = cv2.createBackgroundSubtractorMOG2()
 facedetect = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 recognizer = cv2.face.LBPHFaceRecognizer_create()
 
-trainer_file_path = r'C:\Users\user\Desktop\Theta\Trainer.yml'
+trainer_file_path = os.path.join(data_dir, 'Trainer.yml')
 if os.path.exists(trainer_file_path):
     recognizer.read(trainer_file_path)
 else:
@@ -136,8 +173,17 @@ collect_name = None
 collect_count = 0
 max_collect_count = 100
 
+def is_time_in_range(start, end, current):
+    if start <= end:
+        return start <= current <= end
+    else:
+        return current >= start or current <= end
+
 def generate_frames():
     global video, collecting_faces, collect_id, collect_name, collect_count
+    save_start_time = datetime.strptime('18:00', '%H:%M').time()  # 6:00 PM
+    save_end_time = datetime.strptime('06:00', '%H:%M').time()  # 6:00 AM
+
     while True:
         ret, frame = video.read()
         if not ret:
@@ -148,20 +194,29 @@ def generate_frames():
         faces = facedetect.detectMultiScale(gray, 1.3, 5)
         nonZeroCount = cv2.countNonZero(fgMask)
 
+        current_time = datetime.now().time()
         if nonZeroCount > 5000:
-            current_time = datetime.now()
-            if current_time - last_print_times["motion"] > print_interval:
-                log_message("Motion Detected")
-                last_print_times["motion"] = current_time
+            if is_time_in_range(save_start_time, save_end_time, current_time):
+                if datetime.now() - last_print_times["motion"] > print_interval:
+                    log_message("Motion Detected")
+                    last_print_times["motion"] = datetime.now()
+                    # Save the motion detected image
+                    current_date = datetime.now().strftime('%Y-%m-%d')
+                    date_folder = os.path.join(motion_detected_dir, current_date)
+                    if not os.path.exists(date_folder):
+                        os.makedirs(date_folder)
+                    motion_image_path = os.path.join(date_folder, f"motion_{datetime.now().strftime('%H-%M-%S')}.jpg")
+                    cv2.imwrite(motion_image_path, frame)
+                    # Send email with the motion-detected image
+                    send_email_with_image(motion_image_path)
 
         for (x, y, w, h) in faces:
             if collecting_faces and collect_count < max_collect_count:
                 face_img = gray[y:y+h, x:x+w]
-                dataset_dir = r'C:\Users\user\Desktop\Theta\datasets'
-                if not os.path.exists(dataset_dir):
-                    os.makedirs(dataset_dir)
                 collect_count += 1
-                cv2.imwrite(os.path.join(dataset_dir, f'User.{collect_id}.{collect_count}.jpg'), face_img)
+                collected_image_path = os.path.join(datasets_dir, f'User.{collect_id}.{collect_count}.jpg')
+                cv2.imwrite(collected_image_path, face_img)
+                log_message(f"Collected image: {collected_image_path}")
                 cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
                 if collect_count >= max_collect_count:
                     with open(id_name_file_path, "a") as file:
@@ -175,14 +230,13 @@ def generate_frames():
             else:
                 if os.path.exists(trainer_file_path):
                     serial, conf = recognizer.predict(gray[y:y+h, x:x+w])
-                    text = f"Unknown - Confidence: {round(100 - conf, 2)}%"
+                    text = f"Unknown"
                     if conf <= 80:
                         name = id_name_dict.get(serial, "Unknown")
-                        text = f"{name} - Confidence: {round(100 - conf, 2)}%"
-                        current_time = datetime.now()
-                        if current_time - last_print_times["face"] > print_interval:
+                        text = f"{name}"
+                        if datetime.now() - last_print_times["face"] > print_interval:
                             log_message(f"Face Detected: {name}")
-                            last_print_times["face"] = current_time
+                            last_print_times["face"] = datetime.now()
                     else:
                         current_date = datetime.now().strftime('%Y-%m-%d')
                         date_folder = os.path.join(unknown_faces_dir, current_date)
@@ -190,12 +244,11 @@ def generate_frames():
                             os.makedirs(date_folder)
 
                         face_img = frame[y:y+h, x:x+w]
-                        image_queue.put((face_img, date_folder, current_time.strftime('%m-%d-%Y_%H-%M')))
+                        image_queue.put((face_img, date_folder, datetime.now().strftime('%m-%d-%Y_%H-%M')))
                         new_image_event.set()
-                        current_time = datetime.now()
-                        if current_time - last_print_times["unknown_face"] > print_interval:
+                        if datetime.now() - last_print_times["unknown_face"] > print_interval:
                             log_message("Face Detected: Unknown")
-                            last_print_times["unknown_face"] = current_time
+                            last_print_times["unknown_face"] = datetime.now()
 
                     cv2.putText(frame, text, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                     cv2.rectangle(frame, (x, y), (x+w, y+h), (50, 50, 255), 1)
@@ -265,14 +318,48 @@ def collect_faces():
     collecting_faces = True
     return redirect(url_for('index'))
 
+@app.route('/delete_user', methods=['POST'])
+def delete_user():
+    user_id = int(request.form['id'])
+    user_name = id_name_dict.pop(user_id, None)
+
+    if user_name:
+        # Remove user from id_name.txt
+        with open(id_name_file_path, "r") as f:
+            lines = f.readlines()
+        with open(id_name_file_path, "w") as f:
+            for line in lines:
+                if line.strip().split(',')[0] != str(user_id):
+                    f.write(line)
+
+        # Remove user's dataset images
+        for root, dirs, files in os.walk(datasets_dir):
+            for file in files:
+                if file.startswith(f'User.{user_id}.'):
+                    os.remove(os.path.join(root, file))
+
+        log_message(f"Deleted user ID: {user_id}, Name: {user_name}")
+
+        # Delete the Trainer.yml file
+        if os.path.exists(trainer_file_path):
+            os.remove(trainer_file_path)
+            log_message("Trainer.yml deleted")
+
+        # Retrain the recognizer
+        train_faces()
+
+    else:
+        log_message(f"Attempted to delete non-existing user ID: {user_id}")
+
+    return redirect(url_for('index'))
+
 @app.route('/train_faces', methods=['POST'])
 def train_faces():
-    data_dir = r'C:\Users\user\Desktop\Theta\datasets'
     face_samples = []
     ids = []
 
     # Collect all face samples and their corresponding IDs
-    for root, dirs, files in os.walk(data_dir):
+    for root, dirs, files in os.walk(datasets_dir):
         for file in files:
             if file.endswith('.jpg'):
                 image_path = os.path.join(root, file)
@@ -281,6 +368,12 @@ def train_faces():
                 id = int(os.path.split(image_path)[-1].split(".")[1])
                 face_samples.append(img_numpy)
                 ids.append(id)
+
+    # Check if we have collected enough samples before training
+    if len(face_samples) < 2 or len(ids) < 2:
+        log_message("Insufficient data for training. Need at least two samples.")
+        flash("Insufficient data for training. Need at least two samples.", 'error')
+        return redirect(url_for('index'))
 
     ids = np.array(ids)
     
@@ -296,36 +389,8 @@ def train_faces():
     restart_flask_app()
     return redirect(url_for('index'))
 
-@app.route('/delete_user', methods=['POST'])
-def delete_user():
-    user_id = int(request.form['id'])
-    user_name = id_name_dict.pop(user_id, None)
-    
-    if user_name:
-        # Remove user from id_name.txt
-        with open(id_name_file_path, "r") as f:
-            lines = f.readlines()
-        with open(id_name_file_path, "w") as f:
-            for line in lines:
-                if line.strip().split(',')[0] != str(user_id):
-                    f.write(line)
-        
-        # Remove user's dataset directory
-        dataset_dir = r'C:\Users\user\Desktop\Theta\datasets'
-        for root, dirs, files in os.walk(dataset_dir):
-            for file in files:
-                if file.startswith(f'User.{user_id}.'):
-                    os.remove(os.path.join(root, file))
-        
-        log_message(f"Deleted user ID: {user_id}, Name: {user_name}")
-    else:
-        log_message(f"Attempted to delete non-existing user ID: {user_id}")
-
-    return redirect(url_for('index'))
-
 @app.route('/get_logs')
 def get_logs():
-    logs_dir = r'C:\Users\user\Desktop\Theta\logs'  # Update the directory path
     if not os.path.exists(logs_dir):
         os.makedirs(logs_dir)
     log_files = [file for file in os.listdir(logs_dir) if file.endswith('.txt')]
@@ -333,7 +398,6 @@ def get_logs():
 
 @app.route('/get_logs/<filename>')
 def get_logs_content(filename):
-    logs_dir = 'logs'  # Update the directory path
     file_path = os.path.join(logs_dir, filename)
     
     try:
@@ -387,6 +451,38 @@ def change_password():
     else:
         # Return an error response if the provided email or old password is incorrect
         return jsonify({'success': False, 'message': 'Incorrect email or old password.'}), 400
+
+@app.route('/change_email', methods=['POST'])
+def change_email():
+    data = request.get_json()
+    current_email = data.get('currentEmail')
+    new_email = data.get('newEmail')
+
+    if not current_email or not new_email:
+        return jsonify({"success": False, "message": "Invalid input."}), 400
+
+    # Read the current credentials
+    if not os.path.exists(CREDENTIALS_FILE):
+        return jsonify({"success": False, "message": "Credentials file not found."}), 404
+
+    with open(CREDENTIALS_FILE, 'r') as file:
+        content = file.read().strip()
+
+    try:
+        saved_email, saved_password = content.split(',')
+    except ValueError:
+        return jsonify({"success": False, "message": "Invalid credentials format."}), 500
+
+    # Validate current email
+    if current_email != saved_email:
+        return jsonify({"success": False, "message": "Current email is incorrect."}), 400
+
+    # Update the email in the file
+    new_content = f"{new_email},{saved_password}"
+    with open(CREDENTIALS_FILE, 'w') as file:
+        file.write(new_content)
+
+    return jsonify({"success": True, "message": "Email changed successfully."})
 
 if __name__ == '__main__':
     try:
